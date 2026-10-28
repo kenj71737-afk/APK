@@ -1,0 +1,434 @@
+package com.alad.app.core.service
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import com.alad.app.core.audio.AudioCaptureManager
+import com.alad.app.core.audio.AudioPlayerManager
+import com.alad.app.core.audio.LiveSeparationPipeline
+import com.alad.app.core.audio.AudioUtils
+import com.alad.app.core.network.ALADWebSocketManager
+import com.alad.app.data.repository.DubbingSessionRepository
+import com.alad.app.data.repository.UserPreferencesRepository
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
+
+class AudioDubbingForegroundService : Service() {
+
+    companion object {
+        private const val CHANNEL_ID = "alad_dubbing_channel"
+        private const val NOTIFICATION_ID = 101
+
+        const val ACTION_START = "ACTION_START"
+        const val ACTION_STOP = "ACTION_STOP"
+        const val EXTRA_RESULT_CODE = "EXTRA_RESULT_CODE"
+        const val EXTRA_RESULT_DATA = "EXTRA_RESULT_DATA"
+        private const val TAG = "DubbingService"
+
+        // Delegated to DubbingSessionRepository for backward compatibility
+        val isRunning: StateFlow<Boolean> get() = DubbingSessionRepository.isDubbingRunning
+        val audioAmplitude: StateFlow<Float> get() = DubbingSessionRepository.audioAmplitude
+    }
+
+    private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        Log.e(TAG, "Unhandled exception in serviceScope", throwable)
+    }
+
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob() + coroutineExceptionHandler)
+
+    private var mediaProjection: MediaProjection? = null
+    private var audioCaptureManager: AudioCaptureManager? = null
+    private var audioPlayerManager: AudioPlayerManager? = null
+    private var webSocketManager: ALADWebSocketManager? = null
+    private var liveSeparationPipeline: LiveSeparationPipeline? = null
+    @Volatile private var separationActive: Boolean = false
+    @Volatile private var separationOutputReady: Boolean = false
+    private var settingsObservationJob: Job? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val action = intent?.action
+
+        when (action) {
+            ACTION_START -> {
+                val notification = createNotification()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val serviceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                    } else {
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                    }
+                    startForeground(NOTIFICATION_ID, notification, serviceType)
+                } else {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
+
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+                val data = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+
+                if (resultCode != 0 && data != null) {
+                    startDubbing(resultCode, data)
+                }
+            }
+            ACTION_STOP -> {
+                stopDubbing()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+
+        return START_NOT_STICKY
+    }
+
+    private fun startDubbing(resultCode: Int, data: Intent) {
+        DubbingSessionRepository.setDubbingRunning(true)
+        DubbingSessionRepository.setConnectionStatus("Initializing...")
+        DubbingSessionRepository.clearSubtitle()
+
+        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val projection = projectionManager.getMediaProjection(resultCode, data)
+        if (projection == null) {
+            Log.e(TAG, "Failed to get MediaProjection! ResultCode: $resultCode")
+            DubbingSessionRepository.setConnectionStatus("Capture Denied")
+            DubbingSessionRepository.setDubbingRunning(false)
+            return
+        }
+
+        // CRITICAL FOR ANDROID 14 (API 34): Register MediaProjection.Callback before starting capture
+        val projectionCallback = object : MediaProjection.Callback() {
+            override fun onStop() {
+                Log.d(TAG, "MediaProjection stopped by system")
+                serviceScope.launch(Dispatchers.Main) {
+                    try {
+                        stopDubbing()
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error stopping dubbing from projection callback", e)
+                    }
+                }
+            }
+        }
+        projection.registerCallback(projectionCallback, Handler(Looper.getMainLooper()))
+        mediaProjection = projection
+
+        serviceScope.launch {
+            try {
+                val repository = UserPreferencesRepository(applicationContext)
+
+                val apiKey = repository.apiKeyFlow.first()
+                val targetLang = repository.targetLangFlow.first()
+                val targetDialect = repository.targetDialectFlow.first()
+                val volumeRatio = repository.volumeRatioFlow.first()
+                val isDubbingMuted = repository.isDubbingMutedFlow.first()
+                val originalVolume = repository.originalVolumeFlow.first()
+                val isOriginalMuted = repository.isOriginalMutedFlow.first()
+                val voicePersona = repository.voicePersonaFlow.first()
+                val dubbingMode = repository.dubbingModeFlow.first()
+                val showDualSubtitles = repository.showDualSubtitlesFlow.first()
+                val huggingFaceSpaceUrl = repository.huggingFaceSpaceUrlFlow.first().trim().trimEnd('/')
+                val huggingFaceToken = repository.huggingFaceTokenFlow.first().trim()
+
+                // Sync repository values into the active session
+                DubbingSessionRepository.setDubbingVolume(volumeRatio)
+                DubbingSessionRepository.setDubbingMuted(isDubbingMuted)
+                DubbingSessionRepository.setOriginalVolumeRatio(originalVolume)
+                DubbingSessionRepository.setOriginalMuted(isOriginalMuted)
+                DubbingSessionRepository.setShowDualSubtitles(showDualSubtitles)
+
+                val okHttpClient = OkHttpClient.Builder()
+                    .pingInterval(15, TimeUnit.SECONDS)
+                    .retryOnConnectionFailure(true)
+                    .build()
+
+                webSocketManager = ALADWebSocketManager(okHttpClient)
+
+                // Initialize AudioPlayerManager if not in SUBTITLE_ONLY mode
+                if (dubbingMode != UserPreferencesRepository.MODE_SUBTITLE_ONLY) {
+                    audioPlayerManager = AudioPlayerManager(applicationContext)
+                    audioPlayerManager?.start()
+                    audioPlayerManager?.setVoicePersona(voicePersona)
+                    audioPlayerManager?.setDubbingAudio(volumeRatio, isDubbingMuted)
+                    audioPlayerManager?.setOriginalMediaAudio(originalVolume, isOriginalMuted)
+                    audioPlayerManager?.setPlaybackSpeed(DubbingSessionRepository.dubbingPlaybackSpeed.value)
+                }
+
+                webSocketManager?.onStatusChanged = { status ->
+                    DubbingSessionRepository.setConnectionStatus(status)
+                }
+
+                webSocketManager?.onTextMessageReceived = { textDelta ->
+                    DubbingSessionRepository.appendSubtitleText(textDelta)
+                }
+
+                webSocketManager?.onSourceTextReceived = { sourceChunk ->
+                    DubbingSessionRepository.appendSourceSubtitleText(sourceChunk)
+                }
+
+                webSocketManager?.onTurnComplete = {
+                    DubbingSessionRepository.onTurnComplete()
+                }
+
+                var activeDubbingMode = dubbingMode
+
+                webSocketManager?.onBinaryMessageReceived = { audioChunk ->
+                    if (activeDubbingMode != UserPreferencesRepository.MODE_SUBTITLE_ONLY) {
+                        audioPlayerManager?.playAudioData(audioChunk)
+                    }
+                }
+
+                webSocketManager?.connect(
+                    apiKey = apiKey,
+                    sourceLang = "",
+                    targetLang = targetLang,
+                    voicePersona = voicePersona,
+                    dubbingMode = dubbingMode,
+                    targetDialect = targetDialect
+                )
+
+                // Dynamic observation for audio controls and settings
+                settingsObservationJob?.cancel()
+                settingsObservationJob = serviceScope.launch {
+                    // 1. Reactive dubbing volume updates
+                    launch {
+                        kotlinx.coroutines.flow.combine(
+                            DubbingSessionRepository.dubbingVolume,
+                            DubbingSessionRepository.isDubbingMuted
+                        ) { vol, muted -> Pair(vol, muted) }.collect { (vol, muted) ->
+                            audioPlayerManager?.setDubbingAudio(vol, muted)
+                        }
+                    }
+
+                    // 2. Reactive original media volume & ducking updates
+                    launch {
+                        kotlinx.coroutines.flow.combine(
+                            DubbingSessionRepository.originalVolumeRatio,
+                            DubbingSessionRepository.isOriginalMuted
+                        ) { ratio, muted -> Pair(ratio, muted) }.collect { (ratio, muted) ->
+                            if (separationActive && separationOutputReady) {
+                                // Mute the original video only after the first valid separated
+                                // segment arrives; keep the instrumental stem on its own track.
+                                audioPlayerManager?.setOriginalMediaAudio(0f, true)
+                                // Muting the original video must NOT mute the separated instrumental stem.
+                                // The original-mute toggle controls only the source media; the
+                                // background slider controls the independently rendered stem.
+                                audioPlayerManager?.setInstrumentalVolume(ratio)
+                            } else {
+                                audioPlayerManager?.setOriginalMediaAudio(ratio, muted)
+                            }
+                        }
+                    }
+
+                    // 3. Apply translated voice playback speed immediately when adjusted.
+                    launch {
+                        DubbingSessionRepository.dubbingPlaybackSpeed.collect { speed ->
+                            audioPlayerManager?.setPlaybackSpeed(speed)
+                        }
+                    }
+
+                    // 4. Real-time voice persona timbre shaping without dropping WebSocket
+                    launch {
+                        repository.voicePersonaFlow.collect { newVoice ->
+                            audioPlayerManager?.setVoicePersona(newVoice)
+                        }
+                    }
+
+                    // 5. Real-time dubbing mode switching without dropping WebSocket
+                    launch {
+                        repository.dubbingModeFlow.collect { newMode ->
+                            activeDubbingMode = newMode
+                        }
+                    }
+
+                    // 6. Reconnect WebSocket ONLY when target language or dialect genuinely changes
+                    launch {
+                        var activeLang = targetLang
+                        var activeDialect = targetDialect
+                        kotlinx.coroutines.flow.combine(
+                            repository.targetLangFlow,
+                            repository.targetDialectFlow
+                        ) { lang, dialect -> Pair(lang, dialect) }.collect { (newLang, newDialect) ->
+                            if (newLang != activeLang || newDialect != activeDialect) {
+                                activeLang = newLang
+                                activeDialect = newDialect
+                                val currentKey = repository.apiKeyFlow.first()
+                                val currentVoice = repository.voicePersonaFlow.first()
+                                val currentMode = repository.dubbingModeFlow.first()
+                                webSocketManager?.disconnect()
+                                webSocketManager?.connect(
+                                    apiKey = currentKey,
+                                    sourceLang = "",
+                                    targetLang = newLang,
+                                    voicePersona = currentVoice,
+                                    dubbingMode = currentMode,
+                                    targetDialect = newDialect
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Enable real Demucs source separation only when a Hugging Face Space URL is configured.
+                // Otherwise retain the normal direct-live-translation path.
+                if (huggingFaceSpaceUrl.startsWith("https://") && audioPlayerManager != null) {
+                    separationActive = true
+                    separationOutputReady = false
+                    // Keep the separated music audible even when the original video's speech is muted.
+                    audioPlayerManager?.setInstrumentalVolume(originalVolume)
+                    // Do not mute the source before the first valid Demucs response. This
+                    // avoids silence when the Space URL is wrong, sleeping, or overloaded.
+                    liveSeparationPipeline = LiveSeparationPipeline(
+                        cacheDir = cacheDir,
+                        spaceUrl = huggingFaceSpaceUrl,
+                        bearerToken = huggingFaceToken.ifBlank { null },
+                        onSegmentReady = {
+                            separationOutputReady = true
+                            audioPlayerManager?.beginInstrumentalSyncWindow()
+                            audioPlayerManager?.setOriginalMediaAudio(0f, true)
+                        },
+                        onVocalsPcm = { vocalsPcm -> webSocketManager?.sendAudioData(vocalsPcm) },
+                        onInstrumentalPcm = { instrumentalPcm -> audioPlayerManager?.playInstrumentalPcmData(instrumentalPcm) },
+                        onStatus = { status ->
+                            DubbingSessionRepository.setConnectionStatus(status)
+                            if (status.startsWith("Lỗi tách âm thanh")) {
+                                // Fail open: restore source audio and use direct translation instead of silent playback.
+                                separationActive = false
+                                separationOutputReady = false
+                                audioPlayerManager?.setOriginalMediaAudio(originalVolume, isOriginalMuted)
+                            }
+                        }
+                    )
+                    DubbingSessionRepository.setConnectionStatus("Đã bật tách lời thoại qua Hugging Face · chờ đoạn âm thanh đầu tiên")
+                } else {
+                    separationActive = false
+                    separationOutputReady = false
+                    liveSeparationPipeline = null
+                    if (huggingFaceSpaceUrl.isNotBlank()) {
+                        DubbingSessionRepository.setConnectionStatus("URL Hugging Face không hợp lệ hoặc chế độ chỉ phụ đề; tách âm thanh chưa bật")
+                    }
+                }
+
+                audioCaptureManager = AudioCaptureManager()
+                val appUid = applicationInfo.uid
+
+                mediaProjection?.let { projection ->
+                    audioCaptureManager?.startCapture(projection, appUid) { pcmData ->
+                        val pipeline = liveSeparationPipeline
+                        if (separationActive && pipeline != null) {
+                            pipeline.accept(pcmData)
+                        } else {
+                            webSocketManager?.sendAudioData(pcmData)
+                        }
+
+                        // Process RMS and smoothed amplitude via decoupled AudioUtils
+                        val currentAmp = DubbingSessionRepository.audioAmplitude.value
+                        val newAmp = AudioUtils.processPcmAmplitude(pcmData, currentAmp)
+                        DubbingSessionRepository.setAudioAmplitude(newAmp)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during dubbing session startup", e)
+                DubbingSessionRepository.setConnectionStatus("Error: ${e.message}")
+            }
+        }
+    }
+
+    private fun stopDubbing() {
+        DubbingSessionRepository.resetSession()
+
+        audioCaptureManager?.stopCapture()
+        audioCaptureManager = null
+
+        liveSeparationPipeline?.stop()
+        liveSeparationPipeline = null
+        separationActive = false
+        separationOutputReady = false
+
+        audioPlayerManager?.stop()
+        audioPlayerManager = null
+
+        webSocketManager?.disconnect()
+        webSocketManager = null
+
+        settingsObservationJob?.cancel()
+        settingsObservationJob = null
+
+        mediaProjection?.stop()
+        mediaProjection = null
+    }
+
+    override fun onBind(intent: Intent?): IBinder? {
+        return null
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (DubbingSessionRepository.isDubbingRunning.value) {
+            stopDubbing()
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val name = "Live Dubbing Service"
+            val descriptionText = "Capturing and streaming audio for dubbing"
+            val importance = NotificationManager.IMPORTANCE_LOW
+            val channel = NotificationChannel(CHANNEL_ID, name, importance).apply {
+                description = descriptionText
+            }
+            val notificationManager: NotificationManager =
+                getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun createNotification(): Notification {
+        val intent = Intent(this, com.alad.app.MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = android.app.PendingIntent.getActivity(
+            this, 0, intent, android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val stopIntent = Intent(this, AudioDubbingForegroundService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val stopPendingIntent = android.app.PendingIntent.getService(
+            this, 1, stopIntent, android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("ALAD Live Dubbing")
+            .setContentText("Connected and dubbing...")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentIntent(pendingIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stopPendingIntent)
+            .setOngoing(true)
+            .build()
+        }
+}
